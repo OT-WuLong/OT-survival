@@ -1,0 +1,40 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "OT 生存状态·旧版适配行为包",
+    "description": "适配 1.21.120 起的四项状态与玩家 HUD 位置面板；勿与完整版同时启用。",
+    "uuid": "424f6981-6592-4ff3-94ac-19156cc9ce55",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 120]
+  },
+  "modules": [
+    {
+      "description": "OT 生存状态数据",
+      "type": "data",
+      "uuid": "ef881377-1c82-44fa-9849-98c89bd5eda8",
+      "version": [1, 0, 0]
+    },
+    {
+      "description": "OT 生存状态脚本",
+      "language": "javascript",
+      "type": "script",
+      "uuid": "c6ee80b0-de31-44e2-adaf-d87c2e1701c1",
+      "version": [1, 0, 0],
+      "entry": "scripts/main.js"
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "2.3.0"
+    },
+    {
+      "module_name": "@minecraft/server-ui",
+      "version": "2.0.0"
+    },
+    {
+      "uuid": "5b82a64a-b9bb-4423-b0d1-52b35d4d4ba3",
+      "version": [1, 0, 0]
+    }
+  ]
+}

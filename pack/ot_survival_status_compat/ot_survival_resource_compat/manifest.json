@@ -1,0 +1,24 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "OT 生存状态·旧版适配资源包",
+    "description": "适配版可校准的体力、口渴、温度与理智 HUD 及面板图标。",
+    "uuid": "5b82a64a-b9bb-4423-b0d1-52b35d4d4ba3",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 120]
+  },
+  "modules": [
+    {
+      "description": "OT 生存状态 HUD 资源",
+      "type": "resources",
+      "uuid": "2118fc84-01e3-4a16-a702-dd9a946f68b8",
+      "version": [1, 0, 0]
+    }
+  ],
+  "dependencies": [
+    {
+      "uuid": "424f6981-6592-4ff3-94ac-19156cc9ce55",
+      "version": [1, 0, 0]
+    }
+  ]
+}

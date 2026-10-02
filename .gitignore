@@ -1,0 +1,6 @@
+.venv/
+.env
+.env.*
+!.env.example
+tmp/
+开发笔记.md

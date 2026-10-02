@@ -1,0 +1,9 @@
+{
+  "resource_pack_name": "ot_survival_resource",
+  "texture_name": "atlas.items",
+  "texture_data": {
+    "ot_status_panel": {
+      "textures": "textures/items/status_panel"
+    }
+  }
+}

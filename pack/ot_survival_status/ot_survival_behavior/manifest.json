@@ -1,0 +1,40 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "OT 生存状态行为包",
+    "description": "独立的体力、口渴、温度与理智系统；玩家位置调整和管理员开关。",
+    "uuid": "ed48fd3b-e688-430e-82e3-156cd92d2f78",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 26, 50]
+  },
+  "modules": [
+    {
+      "description": "OT 生存状态数据",
+      "type": "data",
+      "uuid": "2e7590b1-d80a-45e9-bdf4-2aac4b64863b",
+      "version": [1, 0, 0]
+    },
+    {
+      "description": "OT 生存状态脚本",
+      "language": "javascript",
+      "type": "script",
+      "uuid": "2bdca68f-6725-4d07-bd35-5baef66891c6",
+      "version": [1, 0, 0],
+      "entry": "scripts/main.js"
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "2.10.0"
+    },
+    {
+      "module_name": "@minecraft/server-ui",
+      "version": "2.2.0"
+    },
+    {
+      "uuid": "04fd0943-ac47-4654-90f7-135e14deea6c",
+      "version": [1, 0, 0]
+    }
+  ]
+}

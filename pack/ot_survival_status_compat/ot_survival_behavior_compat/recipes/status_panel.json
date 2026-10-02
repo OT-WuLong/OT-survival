@@ -1,0 +1,11 @@
+{
+  "format_version": "1.20.10",
+  "minecraft:recipe_shaped": {
+    "description": { "identifier": "ot:status_panel" },
+    "tags": ["crafting_table"],
+    "pattern": ["DDD", "DDD"],
+    "key": { "D": { "item": "minecraft:dirt" } },
+    "result": { "item": "ot:status_panel", "count": 1 },
+    "unlock": [{ "item": "minecraft:dirt" }]
+  }
+}

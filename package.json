@@ -1,0 +1,10 @@
+{
+  "name": "ot-survival-status-source",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "build": "node tools/build_stamina_hud.mjs && node scripts/build_status_panel.mjs",
+    "hud:inspect": "node tools/inspect_status_hud_load.mjs"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "format_version": "1.26.50",
+  "minecraft:item": {
+    "description": {
+      "identifier": "ot:status_panel",
+      "menu_category": {
+        "category": "items"
+      }
+    },
+    "components": {
+      "minecraft:display_name": {
+        "value": "生存状态面板"
+      },
+      "minecraft:icon": {
+        "textures": {
+          "default": "ot_status_panel"
+        }
+      },
+      "minecraft:interact_button": true,
+      "minecraft:max_stack_size": 1,
+      "ot:status_panel_open": {}
+    }
+  }
+}
