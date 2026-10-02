@@ -45,10 +45,11 @@ test("both variants craft one status panel from six dirt at a crafting table", (
   }
 });
 
-function harness() {
+function harness(behavior = "../pack/ot_survival_status/ot_survival_behavior") {
   let component;
   const forms = [];
   const messages = [];
+  const warnings = [];
   const scores = new Map();
   const properties = new Map([["ot:thirst_enabled", false]]);
   const writes = [];
@@ -97,15 +98,68 @@ function harness() {
       registerCustomComponent(id, value) { assert.equal(id, "ot:status_panel_open"); component = value; }
     } })
   } } };
-  runInNewContext(`${script("../pack/ot_survival_status/ot_survival_behavior/scripts/status_flags.js")}
-    ${script("../pack/ot_survival_status/ot_survival_behavior/scripts/hud_positions.js")}
-    ${script("../pack/ot_survival_status/ot_survival_behavior/scripts/status_panel.js")}`,
+  runInNewContext(`${script(`${behavior}/scripts/status_flags.js`)}
+    ${script(`${behavior}/scripts/hud_positions.js`)}
+    ${script(`${behavior}/scripts/status_panel.js`)}`,
   { world, system, ActionFormData, ModalFormData,
-    PlayerPermissionLevel: { Operator: 2 }, console: { warn() {} } });
-  return { component, forms, messages, scores, properties, writes, player, member };
+    PlayerPermissionLevel: { Operator: 2 }, console: { warn: (message) => warnings.push(message) } });
+  return { component, forms, messages, warnings, scores, properties, writes, player, member };
 }
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const suffix of ["", "_compat"]) test(`switch modal saves without phantom position inputs (${suffix || "full"})`, async () => {
+  const base = `../pack/ot_survival_status${suffix}`;
+  const ui = JSON.parse(read(`${base}/ot_survival_resource${suffix}/ui/server_form.json`));
+  const scene = harness(`${base}/ot_survival_behavior${suffix}`);
+  scene.component.onUse({ source: scene.player });
+  scene.forms[0].resolve({ canceled: false, selection: 0 });
+  await flush();
+  const values = [false, false, false, false];
+  // Model collection slots owned by explicit controls even when their parent is
+  // hidden. This drives the actual save callback, not a Bedrock renderer replay.
+  const inspect = (node) => {
+    for (const entry of node.controls ?? []) {
+      const [name, local] = Object.entries(entry)[0];
+      const reference = name.split("@")[1];
+      if ((reference === "server_form.custom_slider" || reference === "server_form.custom_toggle") &&
+          local.collection_index >= values.length) values[local.collection_index] = undefined;
+      if (reference && ui[reference.replace("server_form.", "")])
+        inspect(ui[reference.replace("server_form.", "")]);
+      else if (!reference) inspect(local);
+    }
+  };
+  inspect(ui.ot_survival_custom_form_router);
+  scene.forms[1].resolve({ canceled: false, formValues: values });
+  await flush();
+  assert.deepEqual(scene.warnings, [], "must not report 开关表单数据无效");
+  for (const state of ["stamina", "thirst", "temperature", "sanity"])
+    assert.equal(scene.properties.get(`ot:${state}_enabled`), false, `${state} must be disabled`);
+  scene.component.onUse({ source: scene.player });
+  scene.forms[2].resolve({ canceled: false, selection: 0 });
+  await flush();
+  assert.deepEqual(scene.forms[3].form.toggles.map((entry) => entry[1]), [false, false, false, false]);
+  scene.forms[3].resolve({ canceled: false, formValues: [true, true, true, true] });
+  await flush();
+  assert.deepEqual(scene.warnings, []);
+  for (const state of ["stamina", "thirst", "temperature", "sanity"])
+    assert.equal(scene.properties.get(`ot:${state}_enabled`), true, `${state} must be re-enabled`);
+});
+
+test("malformed switch responses never save partial settings", async () => {
+  for (const values of [undefined, [], [false, false, false],
+    [false, false, false, false, undefined], [false, false, 0, false]]) {
+    const scene = harness();
+    scene.component.onUse({ source: scene.player });
+    scene.forms[0].resolve({ canceled: false, selection: 0 });
+    await flush();
+    scene.forms[1].resolve({ canceled: false, formValues: values });
+    await flush();
+    assert.equal(scene.writes.length, 0);
+    assert.equal(scene.properties.get("ot:stamina_enabled"), undefined);
+    assert.match(scene.warnings[0], /开关表单数据无效/);
+  }
+});
 
 test("members adjust only their own HUD while equal icon-free operator buttons control global switches", async () => {
   const scene = harness();
@@ -213,14 +267,36 @@ test("position modal fixes reset and green save outside the six-slider scrolling
   assert.deepEqual(scrolling["sliders@common.scrolling_panel"].size, ["100%", "100% - 76px"]);
   const sliders = full.ot_survival_position_sliders;
   assert.equal(sliders.collection_name, "custom_form");
-  assert.deepEqual(sliders.controls.map((control) => Object.values(control)[0].collection_index), [0, 1, 2, 3, 4, 5]);
-  assert.ok(sliders.controls.every((control) => Object.keys(control)[0].endsWith("@server_form.custom_slider")));
+  assert.equal(sliders.controls, undefined, "indices must come from the actual modal collection");
   const fixed = full.ot_survival_position_footer;
   assert.equal(fixed.anchor_from, "bottom_middle");
   assert.equal(fixed.anchor_to, "bottom_middle");
   assert.equal(fixed.collection_name, "custom_form");
   assert.deepEqual(fixed.size, ["100% - 8px", 72]);
-  assert.equal(fixed.controls[0]["reset@server_form.custom_toggle"].collection_index, 6);
+  const reset = fixed.controls[0].reset;
+  assert.deepEqual(reset.size, ["100%", 32]);
+  assert.deepEqual(full["ot_survival_position_reset@server_form.custom_toggle"].size, ["100%", 32]);
+  assert.equal(JSON.stringify(full).includes("collection_index"), false, "hidden forms must not own fixed input slots");
+  for (const [generated, kind, widget] of [[sliders, "slider", "@server_form.custom_slider"],
+    [reset, "toggle", "@server_form.ot_survival_position_reset"]]) {
+    assert.equal(generated.collection_name, "custom_form");
+    assert.equal(generated.factory.name, "buttons");
+    assert.deepEqual(generated.bindings, [
+      { binding_name: "#custom_form_length", binding_name_override: "#collection_length" }
+    ]);
+    for (const [type, target] of Object.entries(generated.factory.control_ids)) {
+      assert.equal(target, type === kind ? widget : "@server_form.ot_survival_empty_field");
+    }
+    // Model native field-type dispatch for both our modals and unrelated forms.
+    // This is a schema regression, not a substitute for client rendering.
+    for (const fields of [Array(4).fill("toggle"), [...Array(6).fill("slider"), "toggle"],
+      ["input", "dropdown", "label", "header", "divider", "step_slider", "multiselect"]]) {
+      const active = fields.flatMap((type, index) =>
+        generated.factory.control_ids[type] === widget ? [index] : []);
+      assert.deepEqual(active, fields.flatMap((type, index) => type === kind ? [index] : []));
+    }
+  }
+  assert.deepEqual(full.ot_survival_empty_field, { type: "panel", size: [0, 0] });
   const save = fixed.controls[2]["save@common_buttons.light_text_button"];
   assert.equal(save.$pressed_button_name, "button.submit_custom_form");
   assert.equal(save.$button_text, "#submit_text");

@@ -8,6 +8,18 @@ const visibleFor = (position) => [
     ? `(#title_text = '${positionTitle}')` : `(not (#title_text = '${positionTitle}'))`,
   target_property_name: "#visible" }
 ];
+// Visibility does not remove a form's inputs. Use the native collection factory
+// so hidden position controls only bind real fields of the matching input type.
+const generatedInputs = (type, control) => ({
+  collection_name: "custom_form",
+  factory: {
+    name: "buttons",
+    control_ids: Object.fromEntries([
+      "label", "toggle", "slider", "step_slider", "dropdown", "input", "header", "divider", "multiselect"
+    ].map((kind) => [kind, kind === type ? control : "@server_form.ot_survival_empty_field"]))
+  },
+  bindings: [{ binding_name: "#custom_form_length", binding_name_override: "#collection_length" }]
+});
 const form = {
   namespace: "server_form",
   "custom_form@common_dialogs.main_panel_no_buttons": {
@@ -40,18 +52,20 @@ const form = {
     type: "stack_panel", orientation: "vertical",
     size: ["100% - 4px", "100%c"], offset: [2, 0],
     anchor_from: "top_left", anchor_to: "top_left",
-    collection_name: "custom_form",
-    controls: Array.from({ length: 6 }, (_, index) => ({
-      [`slider_${index}@server_form.custom_slider`]: { collection_index: index }
-    }))
+    ...generatedInputs("slider", "@server_form.custom_slider")
   },
+  ot_survival_empty_field: { type: "panel", size: [0, 0] },
+  "ot_survival_position_reset@server_form.custom_toggle": { size: ["100%", 32] },
   ot_survival_position_footer: {
     type: "stack_panel", orientation: "vertical",
     size: ["100% - 8px", 72],
     anchor_from: "bottom_middle", anchor_to: "bottom_middle",
     collection_name: "custom_form",
     controls: [
-      { "reset@server_form.custom_toggle": { collection_index: 6, size: ["100%", 32] } },
+      { reset: {
+        type: "stack_panel", orientation: "vertical", size: ["100%", 32],
+        ...generatedInputs("toggle", "@server_form.ot_survival_position_reset")
+      } },
       { gap: { type: "panel", size: ["100%", 4] } },
       { "save@common_buttons.light_text_button": {
         "$pressed_button_name": "button.submit_custom_form",
