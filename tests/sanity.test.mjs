@@ -13,7 +13,11 @@ const script = readFileSync(new URL(
   .replace(/^import \{[^\n]+\} from "\.\.\/status_flags\.js";\s*/, "")
   .replace(/^export /gm, "");
 
-function harness(legacyScore) {
+const compatScript = readFileSync(new URL(
+  "../pack/ot_survival_status_compat/ot_survival_behavior_compat/scripts/sanity/index.js", import.meta.url), "utf8")
+  .replace(/^import [^\n]+\n/gm, "").replace(/^export /gm, "");
+
+function harness(legacyScore, implementation = script) {
   let onTick, onHurt, onCommand, onSpawn, onLeave;
   let time = 0;
   let light = 15;
@@ -26,11 +30,14 @@ function harness(legacyScore) {
   const properties = new Map([["ot:temperature_tier", 2]]);
   const worldProperties = new Map();
   const scores = new Map();
+  const jukeboxes = new Map();
+  const searches = [];
+  const warnings = [];
   const player = {
     id: "player-1", typeId: "minecraft:player", playerPermissionLevel: 2,
-    mode: "survival", isSleeping: false,
+    mode: "survival", isSleeping: false, head: { x: 0, y: 65, z: 0 },
     getGameMode() { return this.mode; },
-    getHeadLocation() { return { x: 0, y: 65, z: 0 }; },
+    getHeadLocation() { return { ...this.head }; },
     getComponent(id) { assert.equal(id, "minecraft:player.hunger"); return { currentValue: hunger }; },
     getDynamicProperty(key) { return properties.get(key); },
     setDynamicProperty(key, value) { properties.set(key, value); },
@@ -43,7 +50,27 @@ function harness(legacyScore) {
       scores.set(this.id, Number(command.split(" ").at(-1)));
       return { successCount: 1 };
     },
-    dimension: { getLightLevel: () => light }
+    dimension: {
+      id: "minecraft:overworld", heightRange: { min: -64, max: 320 },
+      getLightLevel: () => light,
+      getBlocks(volume, filter, allowUnloaded) {
+        assert.deepEqual(Array.from(filter.includeTypes), ["minecraft:jukebox"]);
+        assert.equal(allowUnloaded, true);
+        assert.ok(volume.from.y >= this.heightRange.min && volume.to.y < this.heightRange.max);
+        searches.push(volume);
+        const locations = [...jukeboxes.values()].map((record) => record.location)
+          .filter((loc) => ["x", "y", "z"].every((axis) => loc[axis] >= volume.from[axis] && loc[axis] <= volume.to[axis]));
+        return { getBlockLocationIterator: () => locations.values() };
+      },
+      getBlock(loc) {
+        const record = jukeboxes.get(`${loc.x},${loc.y},${loc.z}`);
+        if (record?.unavailable) throw new Error("LocationInUnloadedChunkError");
+        return record ? { typeId: "minecraft:jukebox", getComponent(id) {
+          assert.equal(id, "minecraft:record_player");
+          return { isPlaying: () => record.playing };
+        } } : undefined;
+      }
+    }
   };
   const signal = (save) => ({ subscribe: save });
   const system = {
@@ -77,18 +104,21 @@ function harness(legacyScore) {
     }
   };
   const sandbox = {
+    BlockVolume: class { constructor(from, to) { this.from = { ...from }; this.to = { ...to }; } },
     GameMode: { Survival: "survival", Adventure: "adventure" },
     PlayerPermissionLevel: { Operator: 2 }, system, world,
     Math: Object.assign(Object.create(Math), { random: () => 0 }),
-    console: { warn() {} }
+    console: { warn: (message) => warnings.push(message) }
   };
   if (legacyScore !== undefined) {
     scores.set(player.id, legacyScore);
     objective = { id: "ot_sanity", getScore: (participant) => scores.get(participant.id ?? participant) };
   }
-  runInNewContext(`${flagsScript}\n${script}\nglobalThis.api = { sanityEnabled, setSanityEnabled, pressure };`, sandbox);
+  runInNewContext(`${flagsScript}\n${implementation}\nglobalThis.api = { sanityEnabled, setSanityEnabled, pressure, stateFor };`, sandbox);
   return {
-    player, properties, worldProperties, effects, sounds, messages, scores,
+    player, properties, worldProperties, effects, sounds, messages, scores, jukeboxes, searches, warnings,
+    sanityValue: () => sandbox.api.stateFor(player).value,
+    jukebox(x, y, z, playing = true) { jukeboxes.set(`${x},${y},${z}`, { location: { x, y, z }, playing }); },
     tick(count = 1) { for (let i = 0; i < count; i++) { system.currentTick++; time++; onTick(); } },
     jumpTime(amount) { time += amount; },
     setLight(value) { light = value; },
@@ -104,6 +134,91 @@ function harness(legacyScore) {
     removeObjective() { objective = undefined; scores.clear(); },
     get time() { return time; }
   };
+}
+
+for (const [edition, implementation] of [["full", script], ["compat", compatScript]]) {
+test(`${edition}: actual jukebox playback adds two sanity per minute without stacking or replacing pressure`, () => {
+  const scene = harness(undefined, implementation);
+  scene.command("50");
+  scene.jukebox(0, 64, 0);
+  scene.jukebox(1, 64, 0);
+  scene.tick(1200);
+  assert.ok(Math.abs(scene.sanityValue() - 55) < 1e-9, "safe recovery three plus music two, not two per jukebox");
+  assert.equal(scene.searches.length, 60, "search only at the one-second sanity update");
+  for (const record of scene.jukeboxes.values()) record.playing = false;
+  scene.tick(1200);
+  assert.ok(Math.abs(scene.sanityValue() - 58) < 1e-9, "a record still in a stopped jukebox gives no music bonus");
+  scene.jukebox(0, 64, 0);
+  scene.setHunger(0);
+  scene.properties.set("ot:temperature_tier", 0);
+  scene.command("50");
+  scene.tick(1200);
+  assert.ok(Math.abs(scene.sanityValue() - 49) < 1e-9, "maximum ongoing pressure three minus music two still loses one");
+  assert.deepEqual(scene.warnings, []);
+});
+
+test(`${edition}: music uses an eight-block 3D radius, handles stopped and unavailable sources and clips world height`, () => {
+  const scene = harness(undefined, implementation);
+  scene.player.head = { x: 0.5, y: 64.5, z: 0.5 };
+  scene.command("50");
+  scene.jukebox(8, 64, 0);
+  scene.tick(20);
+  assert.ok(Math.abs(scene.sanityValue() - (50 + 5 / 60)) < 1e-9, "exactly eight blocks is inside");
+  scene.player.head.x = 0.49;
+  scene.tick(20);
+  assert.ok(Math.abs(scene.sanityValue() - (50 + 8 / 60)) < 1e-9, "just outside eight blocks only receives safe recovery");
+  scene.jukebox(6, 70, 0);
+  scene.tick(20);
+  assert.ok(Math.abs(scene.sanityValue() - (50 + 11 / 60)) < 1e-9, "diagonally outside the sphere is excluded");
+  scene.jukebox(0, 64, 0, false);
+  scene.tick(20);
+  assert.ok(Math.abs(scene.sanityValue() - (50 + 14 / 60)) < 1e-9, "empty or stopped machines do not count");
+  scene.jukebox(0, 64, 0);
+  scene.jukeboxes.get("0,64,0").unavailable = true;
+  scene.jukebox(-1, 64, 0);
+  scene.tick(20);
+  assert.ok(Math.abs(scene.sanityValue() - (50 + 19 / 60)) < 1e-9, "an unreadable source does not hide another playing source");
+  scene.player.head.y = 320.5;
+  scene.jukebox(0, 319, 0);
+  scene.tick(20);
+  assert.ok(scene.searches.at(-1).to.y < 320, "never search above the build ceiling");
+  const searched = scene.searches.length;
+  scene.player.head.y = 400;
+  scene.tick(20);
+  assert.equal(scene.searches.length, searched, "skip a search region wholly outside world height");
+  assert.deepEqual(scene.warnings, []);
+});
+
+test(`${edition}: music respects modes, the sanity switch, independent flags and the hundred-point cap`, () => {
+  const scene = harness(undefined, implementation);
+  scene.jukebox(0, 64, 0);
+  scene.command("50");
+  scene.disable();
+  scene.tick(1200);
+  assert.equal(scene.sanityValue(), 50);
+  assert.equal(scene.searches.length, 0);
+  scene.enable();
+  scene.player.mode = "creative";
+  scene.tick(1200);
+  assert.equal(scene.sanityValue(), 50);
+  assert.equal(scene.searches.length, 0);
+  scene.player.mode = "survival";
+  for (const name of ["stamina", "thirst", "temperature"]) scene.worldProperties.set(`ot:${name}_enabled`, false);
+  scene.properties.set("ot:thirst_value", 0);
+  scene.properties.set("ot:temperature_tier", 0);
+  scene.tick(1200);
+  assert.ok(Math.abs(scene.sanityValue() - 55) < 1e-9, "other systems' switches do not disable listening");
+  scene.command("99");
+  scene.tick(1200);
+  assert.equal(scene.sanityValue(), 100);
+  const searched = scene.searches.length;
+  scene.tick(1200);
+  assert.equal(scene.searches.length, searched, "no music search when full with no ongoing loss");
+  scene.player.dimension.id = "minecraft:nether";
+  scene.tick(1200);
+  assert.equal(scene.sanityValue(), 100, "music can offset Nether pressure, even at a full initial value");
+  assert.ok(scene.searches.length > searched, "full players under pressure must still be checked");
+});
 }
 
 test("old world sanity score seeds the independent pack", () => {

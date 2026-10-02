@@ -9,6 +9,11 @@ const WET_KEY = "ot:temperature_wet_seconds";
 const THIRST_MULTIPLIER_KEY = "ot:thirst_loss_multiplier";
 const STAMINA_MULTIPLIER_KEY = "ot:stamina_recovery_multiplier";
 const SCORE_ID = "ot_temperature";
+const POWDER_SNOW_CAP = 5;
+const FIRE_RESISTANCE_TARGET_REDUCTION = 20;
+const FIRE_RESISTANCE_WARMING_MULTIPLIER = 0.5;
+const FIRE_PROTECTION_PER_LEVEL = 0.05;
+const FIRE_PROTECTION_MAX_REDUCTION = 0.8;
 const COLD_BIOMES = new Set([
   "minecraft:snowy_plains", "minecraft:ice_spikes", "minecraft:snowy_taiga",
   "minecraft:ice_plains", "minecraft:ice_plains_spikes", "minecraft:cold_taiga",
@@ -18,16 +23,33 @@ const COLD_BIOMES = new Set([
   "minecraft:frozen_peaks", "minecraft:jagged_peaks", "minecraft:snowy_slopes",
   "minecraft:frozen_ocean", "minecraft:deep_frozen_ocean", "minecraft:frozen_river"
 ]);
-const HOT_BIOMES = new Set([
+const DRY_BIOMES = new Set([
   "minecraft:desert", "minecraft:badlands", "minecraft:eroded_badlands",
-  "minecraft:wooded_badlands", "minecraft:savanna", "minecraft:savanna_plateau",
-  "minecraft:windswept_savanna", "minecraft:desert_hills", "minecraft:desert_mutated",
+  "minecraft:wooded_badlands", "minecraft:desert_hills", "minecraft:desert_mutated",
   "minecraft:mesa", "minecraft:mesa_bryce", "minecraft:mesa_mutated",
   "minecraft:mesa_plateau", "minecraft:mesa_plateau_mutated",
-  "minecraft:mesa_plateau_stone", "minecraft:mesa_plateau_stone_mutated",
+  "minecraft:mesa_plateau_stone", "minecraft:mesa_plateau_stone_mutated"
+]);
+const HOT_BIOMES = new Set([
+  ...DRY_BIOMES, "minecraft:savanna", "minecraft:savanna_plateau", "minecraft:windswept_savanna",
   "minecraft:savanna_mutated", "minecraft:savanna_plateau_mutated"
 ]);
-const HEAT_BLOCKS = new Set(["minecraft:campfire", "minecraft:soul_campfire", "minecraft:fire"]);
+const SUBTROPICAL_BIOMES = new Set([
+  "minecraft:jungle", "minecraft:jungle_hills", "minecraft:jungle_mutated",
+  "minecraft:jungle_edge", "minecraft:jungle_edge_mutated",
+  "minecraft:bamboo_jungle", "minecraft:bamboo_jungle_hills",
+  "minecraft:warm_ocean", "minecraft:deep_warm_ocean"
+]);
+const HEAT_BLOCKS = new Map([
+  ["minecraft:campfire", 20], ["minecraft:soul_campfire", 20], ["minecraft:fire", 20],
+  ["minecraft:lava", 30], ["minecraft:flowing_lava", 30],
+  ["minecraft:lit_furnace", 15], ["minecraft:lit_blast_furnace", 15], ["minecraft:lit_smoker", 15],
+  ["minecraft:magma", 10]
+]);
+const COLD_BLOCKS = new Map([
+  ["minecraft:snow", 5], ["minecraft:snow_layer", 5], ["minecraft:powder_snow", 5],
+  ["minecraft:ice", 10], ["minecraft:packed_ice", 15], ["minecraft:blue_ice", 20]
+]);
 const WARM_FOODS = new Set(["minecraft:mushroom_stew", "minecraft:rabbit_stew",
   "minecraft:beetroot_soup", "minecraft:suspicious_stew"]);
 const ARMOR_SLOTS = [EquipmentSlot.Head, EquipmentSlot.Chest, EquipmentSlot.Legs, EquipmentSlot.Feet];
@@ -129,12 +151,13 @@ function setWetSeconds(state, seconds) {
   state.player.setDynamicProperty(WET_KEY, next || undefined);
 }
 
-function nearbyHeat(player, head) {
+function nearbySources(player, head) {
   const { x, y, z } = player.location;
   const origin = { x: Math.floor(x), y: Math.floor(y), z: Math.floor(z) };
   const topY = Math.max(origin.y + 1, Math.floor(head.y));
   const { min, max } = player.dimension.heightRange;
   let heat = 0;
+  let cold = 0;
   // ponytail: scan nearby blocks once per second; cache only if multiplayer profiling shows a cost.
   for (let blockY = Math.max(origin.y - 1, min); blockY <= Math.min(topY, max - 1); blockY++) for (let dx = -4; dx <= 4; dx++) {
     for (let dz = -4; dz <= 4; dz++) {
@@ -144,18 +167,28 @@ function nearbyHeat(player, head) {
       try { block = player.dimension.getBlock({ x: origin.x + dx, y: blockY, z: origin.z + dz }); }
       catch { continue; } // A scan cell can cross the dimension height boundary.
       const id = block?.typeId;
-      const sourceHeat = id === "minecraft:lava" || id === "minecraft:flowing_lava" ? 30
-        : HEAT_BLOCKS.has(id) ? 20 : 0;
-      if (sourceHeat) heat = Math.max(heat, Math.round(sourceHeat * Math.min(1, (5 - distance) / 4)));
+      const sourceHeat = HEAT_BLOCKS.get(id) ?? 0;
+      const sourceCold = COLD_BLOCKS.get(id) ?? 0;
+      const scale = Math.min(1, (5 - distance) / 4);
+      if (sourceHeat) heat = Math.max(heat, Math.round(sourceHeat * scale));
+      if (sourceCold) cold = Math.max(cold, Math.round(sourceCold * scale));
     }
   }
-  return heat;
+  return { heat, cold };
 }
 
-function leatherPieces(player) {
+function armorInsulation(player) {
   const equipment = player.getComponent("minecraft:equippable");
-  if (!equipment) return 0;
-  return ARMOR_SLOTS.filter((slot) => equipment.getEquipment(slot)?.typeId.startsWith("minecraft:leather_")).length;
+  let leather = 0;
+  let fireProtection = 0;
+  if (equipment) for (const slot of ARMOR_SLOTS) {
+    const item = equipment.getEquipment(slot);
+    if (item?.typeId.startsWith("minecraft:leather_")) leather++;
+    const level = item?.getComponent("minecraft:enchantable")?.getEnchantment("fire_protection")?.level;
+    if (Number.isFinite(level)) fireProtection += Math.max(0, Math.min(4, level));
+  }
+  return { leather, heatReduction: Math.min(FIRE_PROTECTION_MAX_REDUCTION,
+    fireProtection * FIRE_PROTECTION_PER_LEVEL) };
 }
 
 function movementHeat(player) {
@@ -167,23 +200,59 @@ function movementHeat(player) {
   return velocity.x ** 2 + velocity.z ** 2 > 0.0025 ? 1 : 0;
 }
 
+function inPowderSnow(player, head) {
+  const feet = player.location;
+  const box = typeof player.getAABB === "function" ? player.getAABB() : undefined;
+  // ponytail: without native bounds, estimate a 0.6-wide vanilla player; scaled bodies need native AABB.
+  const lower = box ? { x: box.center.x - box.extent.x, y: box.center.y - box.extent.y,
+    z: box.center.z - box.extent.z } : { x: feet.x - 0.3, y: feet.y, z: feet.z - 0.3 };
+  const upper = box ? { x: box.center.x + box.extent.x, y: box.center.y + box.extent.y,
+    z: box.center.z + box.extent.z } : { x: feet.x + 0.3,
+      y: Math.max(feet.y + 0.1, head.y + 0.18), z: feet.z + 0.3 };
+  const { min, max } = player.dimension.heightRange;
+  // Exclude merely touching faces, especially the snow surface under leather boots.
+  for (let y = Math.max(min, Math.floor(lower.y + 0.0001)); y <= Math.min(max - 1, Math.floor(upper.y - 0.0001)); y++) {
+    for (let x = Math.floor(lower.x + 0.0001); x <= Math.floor(upper.x - 0.0001); x++) {
+      for (let z = Math.floor(lower.z + 0.0001); z <= Math.floor(upper.z - 0.0001); z++) {
+        try {
+          if (player.dimension.getBlock({ x, y, z })?.typeId === "minecraft:powder_snow") return true;
+        } catch { /* Ignore cells outside loaded chunks, as with the heat scan. */ }
+      }
+    }
+  }
+  return false;
+}
+
+function dayNightTarget(time, day, night) {
+  // Dawn wraps from 22000 through midnight to 1000; dusk spans 11000..14000.
+  const daylight = time < 1000 ? (time + 2000) / 3000
+    : time <= 11000 ? 1 : time < 14000 ? (14000 - time) / 3000
+      : time <= 22000 ? 0 : (time - 22000) / 3000;
+  return night + (day - night) * daylight;
+}
+
 function environment(player, activity = movementHeat(player) + (player.isJumping && !player.isSwimming ? 2 : 0),
   wetSeconds = 0) {
   const dimension = player.dimension;
+  const time = world.getTimeOfDay();
   let target = dimension.id.endsWith("nether") ? 85 : dimension.id === "minecraft:the_end" ? 35 : 50;
   let coldBiome = false;
   let hotBiome = false;
+  let diurnalBiome = false;
   if (dimension.id.endsWith("overworld")) {
     const biome = dimension.getBiome(sampleLocation(dimension, player.location)).id;
     coldBiome = COLD_BIOMES.has(biome);
     hotBiome = HOT_BIOMES.has(biome);
-    target = coldBiome ? 20 : hotBiome ? 75 : 50;
+    const dryBiome = DRY_BIOMES.has(biome);
+    diurnalBiome = coldBiome || dryBiome;
+    target = coldBiome ? dayNightTarget(time, 25, 15)
+      : dryBiome ? dayNightTarget(time, 75, 30) : hotBiome ? 75
+        : SUBTROPICAL_BIOMES.has(biome) ? 60 : 50;
     target -= Math.min(20, Math.max(0, player.location.y - 96) / 8);
   }
   const head = player.getHeadLocation();
   const top = dimension.getTopmostBlock({ x: Math.floor(head.x), z: Math.floor(head.z) });
   const outdoors = !top || top.location.y < head.y;
-  const time = world.getTimeOfDay();
   const weather = world.getDynamicProperty(WEATHER_KEY);
   const raining = dimension.id.endsWith("overworld") && outdoors &&
     (weather === "Rain" || weather === "Thunder");
@@ -195,11 +264,12 @@ function environment(player, activity = movementHeat(player) + (player.isJumping
       target += 5;
       sunny = true;
     }
-    if (time >= 14000 && time <= 22000) target -= 6;
+    if (!diurnalBiome && time >= 14000 && time <= 22000) target -= 6;
   }
   const burning = !!player.getComponent("minecraft:onfire");
-  const heat = Math.max(burning ? 20 : 0, nearbyHeat(player, head));
-  target += heat;
+  const nearby = nearbySources(player, head);
+  const heat = Math.max(burning ? 20 : 0, nearby.heat);
+  target += heat - (coldBiome ? 0 : nearby.cold);
   if (player.isInWater) target -= coldBiome ? 20 : 10;
   if (player.isGliding) target -= 6;
   target += Math.min(10, activity);
@@ -208,14 +278,22 @@ function environment(player, activity = movementHeat(player) + (player.isJumping
   const hunger = player.getComponent("minecraft:player.hunger")?.currentValue;
   if (target < 50) target -= hunger !== undefined && hunger <= 0 ? 10
     : hunger !== undefined && hunger <= 6 ? 5 : 0;
-  const leather = leatherPieces(player);
+  const armor = armorInsulation(player);
+  const leather = armor.leather;
   if (!wetNow && wetSeconds <= 0) target += 2 * leather;
+  // Keep useful warmth up to fifty, and never subtract a biome's own heat.
+  target -= Math.max(0, Math.min(heat, target - 50)) * armor.heatReduction;
+  const powderSnow = inPowderSnow(player, head);
+  const insulated = !powderSnow && target > 50 && !!player.getEffect("minecraft:fire_resistance");
+  if (insulated) target = Math.max(50, clamp(target) - FIRE_RESISTANCE_TARGET_REDUCTION);
   let rate = target === 50 ? 2 : 1;
   if (player.isInWater) rate *= 3;
   else if (outdoors && !hotBiome && raining && target < 50) rate *= 1.5;
-  return { target: clamp(target), coolingRate: rate * (wetNow || wetSeconds > 0 ? 1 : 1 - leather / 8) *
+  return { target: clamp(powderSnow ? Math.min(target, POWDER_SNOW_CAP) : target),
+    powderSnow, coolingRate: rate * (wetNow || wetSeconds > 0 ? 1 : 1 - leather / 8) *
     (player.isGliding ? 1.5 : 1),
-    warmingRate: rate * (burning ? 3 : 1), wetNow, dryingFast: heat > 0 || sunny };
+    warmingRate: rate * (burning ? 3 : 1) * (insulated ? FIRE_RESISTANCE_WARMING_MULTIPLIER : 1),
+    wetNow, dryingFast: heat > 0 || sunny };
 }
 
 function applyTemperatureDamage(state) {
@@ -306,12 +384,13 @@ system.runInterval(() => {
       if (temperatureEnabled() && activeMode(player)) {
         const activity = state.activity;
         state.activity = 0;
-        const { target, coolingRate, warmingRate, wetNow, dryingFast } =
+        const { target, coolingRate, warmingRate, wetNow, dryingFast, powderSnow } =
           environment(player, activity, state.wetSeconds);
         setWetSeconds(state, wetNow ? 90 : state.wetSeconds - (dryingFast ? 3 : 1));
         const difference = target - state.value;
-        setValue(state, state.value + Math.sign(difference) * Math.min(Math.abs(difference),
-          difference < 0 ? coolingRate : warmingRate));
+        const next = state.value + Math.sign(difference) * Math.min(Math.abs(difference),
+          difference < 0 ? coolingRate : warmingRate);
+        setValue(state, powderSnow ? Math.min(state.value, POWDER_SNOW_CAP, next) : next);
         applyTemperatureDamage(state);
       } else {
         state.activity = state.damageSeconds = 0;

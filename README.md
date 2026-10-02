@@ -11,6 +11,8 @@
 
 两版说明与原“四项状态数值基线”统一合并到 `pack/数值说明.md`；以后调参只维护这份文件。
 
+本聊天专职负责生存包；多 agent 的职责边界和其他包的压缩交接见 [协作范围](开发笔记.md#协作范围与压缩交接)。
+
 ## 目录
 
 | 目录                                | 内容                                     |
@@ -22,9 +24,13 @@
 | `scripts/`                        | HUD 定位及位置面板生成器                 |
 | `tests/`                          | 生存包专用自动测试                       |
 
+纹理源文件与运行包使用相同英文名：体力为 `stamina_frame.png`／`stamina_fill.png`，理智为 `sanity_fill.png`；温度为 `temp_freezing.png`、`temp_cold.png`、`temp_normal.png`、`temp_hot.png`、`temp_scorching.png`，口渴环为 `temp_ring_empty.png`／`temp_ring_full.png`。
+
+`thirst_fill_legacy.png` 是旧竖条口渴素材，仅保留为源文件，不参与当前 HUD 或打包。`tools/debug/sanity_state_prototype.html` 也是离线历史原型，不是运行界面。
+
 ## 开发命令
 
-修改包发布版本前，先阅读 [版本维护约定](AGENTS.md)。
+没有用户明确要求，不修改包发布版本；当前两版固定为 1.0.0。
 
 在本目录运行，使用现有 Node.js，无需添加依赖：
 

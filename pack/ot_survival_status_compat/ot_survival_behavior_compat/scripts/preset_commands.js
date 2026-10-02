@@ -1,5 +1,5 @@
 import { ScriptEventSource, system } from "@minecraft/server";
-import { setStaminaEnabled, setThirstEnabled } from "./stamina_probe/index.js";
+import { setStaminaEnabled, setThirstEnabled } from "./stamina/index.js";
 import { setTemperatureEnabled } from "./temperature/index.js";
 import { setSanityEnabled } from "./sanity/index.js";
 

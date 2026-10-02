@@ -37,7 +37,7 @@ test("compatibility pack is separate from the untouched full pack", () => {
 });
 
 test("API 2.3 loads without newer swing, mining-start or hurt-before events", () => {
-  const source = read("ot_survival_behavior_compat/scripts/stamina_probe/index.js")
+  const source = read("ot_survival_behavior_compat/scripts/stamina/index.js")
     .replace(/^import [^\n]+\n/gm, "").replace(/^export /gm, "");
   const callbacks = {};
   const warnings = [];
@@ -63,6 +63,7 @@ test("API 2.3 loads without newer swing, mining-start or hurt-before events", ()
     "playerSpawn", "playerLeave"];
   const afterEvents = Object.fromEntries(afterNames.map((name) => [name, signal(name)]));
   const sandbox = {
+    EquipmentSlot: { Head: "Head", Chest: "Chest", Legs: "Legs", Feet: "Feet" },
     GameMode: { Survival: "survival", Adventure: "adventure" },
     InputPermissionCategory: { Jump: "Jump" },
     PlayerPermissionLevel: { Operator: 2 },

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "build": "node tools/build_stamina_hud.mjs && node scripts/build_status_panel.mjs",
+    "build": "node tools/build_status_hud.mjs && node scripts/build_status_panel.mjs",
     "hud:inspect": "node tools/inspect_status_hud_load.mjs"
   }
 }

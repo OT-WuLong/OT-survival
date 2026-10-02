@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>理智状态讨论原型</title>
+<style>
+  :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #111b20; color: #edf6f4; }
+  * { box-sizing: border-box; }
+  body { max-width: 900px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { margin: 0 0 8px; font-size: 1.7rem; }
+  h2 { margin: 0 0 12px; font-size: 1.15rem; }
+  p { margin: 0 0 16px; color: #c5d6d2; }
+  .note { border-left: 4px solid #5fd2b3; padding: 10px 14px; background: #1c3032; }
+  section { margin-top: 20px; padding: 18px; border: 1px solid #41565a; border-radius: 12px; background: #1a272d; }
+  .meter { height: 22px; border: 2px solid #9db7b2; border-radius: 5px; overflow: hidden; background: #0c1316; }
+  #fill { height: 100%; width: 100%; background: #5fd2b3; }
+  dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 10px; margin: 16px 0 0; }
+  dl div { padding: 10px 12px; border-radius: 8px; background: #26373d; }
+  dt { color: #bad0ca; font-size: .85rem; }
+  dd { margin: 3px 0 0; font-weight: 600; }
+  button { min-height: 44px; padding: 8px 13px; border: 1px solid #75b5a5; border-radius: 8px; color: #edf6f4; background: #2a4748; font: inherit; cursor: pointer; }
+  button:hover { background: #35605b; }
+  button:focus-visible { outline: 3px solid #b8f0dd; outline-offset: 2px; }
+  button:disabled { opacity: .4; cursor: default; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tabs button[aria-selected="true"] { background: #387e6a; border-color: #9be5cd; }
+  #scenario-text { margin: 14px 0; }
+  #last { margin: 14px 0 0; color: #bff2df; }
+  .small { margin-top: 18px; font-size: .9rem; }
+</style>
+<main>
+  <h1>理智状态 · 讨论原型</h1>
+  <p class="note">问题：跌破 75 的短暂速度 I 能否只触发一次，直到触发后至少回满 100 一次、并经过一天才重新待命？跌破 50、25 后的效果会不会过密？此页只模拟门槛和冷却，不是游戏功能；各原因的扣值仅供试手感。</p>
+  <section aria-labelledby="state-title">
+    <h2 id="state-title">当前状态</h2>
+    <div id="meter" class="meter" role="progressbar" aria-label="理智值" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"><div id="fill"></div></div>
+    <dl id="state"></dl>
+    <p id="last" role="status" aria-live="polite">初始状态：理智 100。</p>
+  </section>
+  <section aria-labelledby="free-title">
+    <h2 id="free-title">自由试玩</h2>
+    <div id="free" class="buttons"></div>
+  </section>
+  <section aria-labelledby="guided-title">
+    <h2 id="guided-title">情景演练</h2>
+    <div id="tabs" class="buttons tabs" role="tablist" aria-label="选择情景"></div>
+    <p id="scenario-text"></p>
+    <div id="steps" class="buttons"></div>
+  </section>
+  <p class="small">暂定规则：速度 I 持续 6 秒，仅向下跨过 75 且“待命”时触发；触发后至少回满 100 一次，且经过 24,000 游戏刻才重新待命，不要求连续满值。低于 50 时每分钟短暂虚弱 I；低于 25 时持续黑暗、恐怖音效至少间隔 45 秒。这里的“一天”按经过的游戏刻计，不按睡觉跳过的日历天计。这些时长都可以讨论。</p>
+</main>
+<script>
+  // Pure prototype reducer: no DOM, storage, game API, or randomness.
+  const DAY = 24000, MINUTE = 1200;
+  const fresh = () => ({ sanity: 100, tick: 0, panicReady: true, panicAt: null, reachedFull: false,
+    speedUntil: 0, weaknessUntil: 0, nextWeakness: null, weaknessCount: 0,
+    nextSound: null, soundCount: 0, last: "初始状态：理智 100。" });
+  function reduce(state, action) {
+    if (action.kind === "reset") return fresh();
+    const next = { ...state }, notes = [];
+    const before = next.sanity;
+    if (action.kind === "set") next.sanity = action.value;
+    if (action.kind === "change") next.sanity = Math.max(0, Math.min(100, next.sanity + action.value));
+    if (action.kind === "wait") next.tick += action.value;
+
+    if (before >= 75 && next.sanity < 75 && next.panicReady) {
+      next.panicReady = false;
+      next.panicAt = next.tick;
+      next.reachedFull = false;
+      next.speedUntil = next.tick + 120;
+      notes.push("惊慌冲刺触发一次");
+    }
+    if (!next.panicReady && next.sanity === 100) next.reachedFull = true;
+    if (!next.panicReady && next.reachedFull && next.tick - next.panicAt >= DAY) {
+      next.panicReady = true;
+      notes.push("惊慌冲刺重新待命");
+    }
+
+    if (next.sanity < 50) {
+      if (next.nextWeakness === null) next.nextWeakness = next.tick + MINUTE;
+      if (next.tick >= next.nextWeakness) {
+        const count = 1 + Math.floor((next.tick - next.nextWeakness) / MINUTE);
+        next.weaknessUntil = next.nextWeakness + (count - 1) * MINUTE + 100;
+        next.nextWeakness += count * MINUTE;
+        next.weaknessCount += count;
+        notes.push(`虚弱 I 触发 ${count} 次`);
+      }
+    } else { next.nextWeakness = null; next.weaknessUntil = 0; }
+
+    if (next.sanity < 25) {
+      if (next.nextSound === null) next.nextSound = next.tick;
+      if (next.tick >= next.nextSound) {
+        const count = 1 + Math.floor((next.tick - next.nextSound) / 900);
+        next.nextSound += count * 900;
+        next.soundCount += count;
+        notes.push(`恐怖音效触发 ${count} 次`);
+      }
+    } else next.nextSound = null;
+    next.last = `${action.label}。${notes.length ? notes.join("；") : "没有新的效果触发"}。`;
+    return next;
+  }
+
+  const actions = [
+    { label: "受伤 −15", kind: "change", value: -15 },
+    { label: "饥饿 −10", kind: "change", value: -10 },
+    { label: "寒冷／炎热 −10", kind: "change", value: -10 },
+    { label: "久未睡 −10", kind: "change", value: -10 },
+    { label: "黑暗 −10", kind: "change", value: -10 },
+    { label: "安全休息 +20", kind: "change", value: 20 },
+    { label: "设为 74", kind: "set", value: 74 },
+    { label: "设为 49", kind: "set", value: 49 },
+    { label: "设为 24", kind: "set", value: 24 },
+    { label: "恢复至 100", kind: "set", value: 100 },
+    { label: "经过 1 分钟", kind: "wait", value: MINUTE },
+    { label: "经过半天", kind: "wait", value: DAY / 2 },
+    { label: "经过 1 天", kind: "wait", value: DAY },
+    { label: "重新开始", kind: "reset" }
+  ];
+  const byLabel = (label) => actions.find((action) => action.label === label);
+  const scenarios = [
+    { title: "不能刷速度", description: "先跌破 75，恢复到 75 以上后马上再跌破：不应获得第二次速度。",
+      steps: ["设为 74", "安全休息 +20", "设为 74"] },
+    { title: "回满且过一天", description: "回满一次还不够；自第一次触发起过一天后，即使中途又掉理智，也可以重新待命。",
+      steps: ["设为 74", "恢复至 100", "经过半天", "设为 74", "经过半天", "安全休息 +20", "设为 74"] },
+    { title: "低理智效果", description: "低于 50 的虚弱是间歇的；低于 25 的黑暗持续，音效有间隔。",
+      steps: ["设为 49", "经过 1 分钟", "设为 24", "经过 1 分钟", "安全休息 +20", "安全休息 +20"] }
+  ];
+
+  let state = fresh(), selected = -1, step = 0;
+  const makeButton = (label, click) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", click);
+    return button;
+  };
+  for (const action of actions) document.querySelector("#free").append(makeButton(action.label, () => {
+    selected = -1;
+    state = reduce(state, action);
+    render();
+  }));
+
+  function render() {
+    document.querySelector("#fill").style.width = `${state.sanity}%`;
+    document.querySelector("#meter").setAttribute("aria-valuenow", state.sanity);
+    const cooldown = state.panicReady ? "可触发" : !state.reachedFull
+      ? "锁定：先恢复到 100" : `已回满一次，冷却还需 ${Math.max(0, Math.ceil((DAY - (state.tick - state.panicAt)) / MINUTE))} 分钟`;
+    const items = [
+      ["理智", `${state.sanity} / 100`],
+      ["惊慌冲刺", state.tick < state.speedUntil ? `速度 I，剩 ${Math.ceil((state.speedUntil - state.tick) / 20)} 秒` : "当前没有"],
+      ["再次触发", cooldown],
+      ["虚弱 I", state.tick < state.weaknessUntil ? "当前生效" : state.sanity < 50 ? "等待下一次" : "不会触发"],
+      ["虚弱累计", `${state.weaknessCount} 次`],
+      ["视野黑暗", state.sanity < 25 ? "持续" : "无"],
+      ["恐怖音效累计", `${state.soundCount} 次`],
+      ["演示时间", `${Math.floor(state.tick / MINUTE)} 分钟`]
+    ];
+    const panel = document.querySelector("#state");
+    panel.replaceChildren(...items.map(([key, value]) => {
+      const row = document.createElement("div"), term = document.createElement("dt"), detail = document.createElement("dd");
+      term.textContent = key; detail.textContent = value; row.append(term, detail); return row;
+    }));
+    document.querySelector("#last").textContent = state.last;
+
+    const tabs = document.querySelector("#tabs");
+    tabs.replaceChildren(...scenarios.map((scenario, index) => {
+      const button = makeButton(scenario.title, () => { selected = index; step = 0; state = fresh(); render(); });
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", String(index === selected));
+      return button;
+    }));
+    const scenario = scenarios[selected];
+    document.querySelector("#scenario-text").textContent = scenario?.description ?? "选择情景后，从左到右点按步骤。自由试玩随时可用。";
+    const steps = document.querySelector("#steps");
+    steps.replaceChildren(...(scenario?.steps ?? []).map((label, index) => {
+      const button = makeButton(`${index + 1}. ${label}`, () => {
+        state = reduce(state, byLabel(label)); step++; render();
+      });
+      button.disabled = index !== step;
+      return button;
+    }));
+  }
+  render();
+</script>
+</html>

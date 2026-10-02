@@ -1,4 +1,4 @@
-import "./stamina_probe/index.js";
+import "./stamina/index.js";
 import "./temperature/index.js";
 import "./sanity/index.js";
 import "./preset_commands.js";

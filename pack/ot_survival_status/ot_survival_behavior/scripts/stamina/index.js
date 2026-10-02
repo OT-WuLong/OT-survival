@@ -1,4 +1,4 @@
-import { GameMode, InputPermissionCategory, PlayerPermissionLevel, system, world } from "@minecraft/server";
+import { EquipmentSlot, GameMode, InputPermissionCategory, PlayerPermissionLevel, system, world } from "@minecraft/server";
 import { legacyScore, statusEnabled, setStatusEnabled } from "../status_flags.js";
 import { hudPositionMarkers } from "../hud_positions.js";
 
@@ -21,8 +21,12 @@ const TITLE_OPTIONS = { fadeInDuration: 0, stayDuration: 0, fadeOutDuration: 0 }
 const SPRINT_COST = 0.15;
 const SWIM_COST = 0.2;
 const JUMP_COST = 2;
+const ARMOR_SLOTS = [EquipmentSlot.Head, EquipmentSlot.Chest, EquipmentSlot.Legs, EquipmentSlot.Feet];
+const ARMOR_LOAD = { chainmail: 0.05, copper: 0.075, golden: 0.1, iron: 0.1,
+  diamond: 0.075, netherite: 0.125 };
 const SLOW_RECOVERY = 0.2;
 const FAST_RECOVERY = 0.4;
+const MINING_COST = 0.1;
 const MIN_BLOCK_COST = 1;
 const BOW_COST = 0.05;
 const CROSSBOW_COST = 0.1;
@@ -32,14 +36,23 @@ const PASSIVE_THIRST_LOSS = 1 / 400;
 const SPRINT_THIRST_EXTRA = 0.00375;
 const SWIM_THIRST_EXTRA = 0.005;
 const JUMP_THIRST_LOSS = 0.05;
+const MINING_THIRST_EXTRA = 0.0025;
 const MIN_BLOCK_THIRST_LOSS = 0.025;
 const INJURY_CAUSES = new Set(["entityAttack", "maceSmash", "projectile", "fall",
   "blockExplosion", "entityExplosion"]);
 const BOW_THIRST_EXTRA = 0.00125;
 const CROSSBOW_THIRST_EXTRA = 0.0025;
+const MISS_THIRST_LOSS = 0.025;
 const HIT_THIRST_LOSS = 0.05;
+const SWING_HIT_GRACE_TICKS = 10;
 const UNDERWATER_THIRST_GAIN = 1 / 20;
 const RAIN_THIRST_GAIN = 0.005;
+const SEA_BIOMES = new Set([
+  "minecraft:ocean", "minecraft:deep_ocean", "minecraft:warm_ocean", "minecraft:deep_warm_ocean",
+  "minecraft:lukewarm_ocean", "minecraft:deep_lukewarm_ocean",
+  "minecraft:cold_ocean", "minecraft:deep_cold_ocean", "minecraft:frozen_ocean",
+  "minecraft:deep_frozen_ocean", "minecraft:legacy_frozen_ocean"
+]);
 const DRINK_GAIN = { "minecraft:milk_bucket": 20, "minecraft:beetroot_soup": 10,
   "minecraft:mushroom_stew": 10, "minecraft:rabbit_stew": 10,
   "minecraft:suspicious_stew": 10 };
@@ -99,6 +112,8 @@ function stateFor(player) {
     sanityDisplay: Number.isFinite(player.getDynamicProperty(SANITY_VALUE_KEY))
       ? Math.max(0, Math.min(100, player.getDynamicProperty(SANITY_VALUE_KEY))) : 100,
     thirstSaved: Math.round(thirst),
+    waterSample: undefined,
+    armorSample: undefined,
     thirstDebug: false,
     damageTicks: 0,
     damageSevere: false,
@@ -111,7 +126,12 @@ function stateFor(player) {
     title: "",
     debug: false,
     slowRefresh: 0,
+    mining: undefined,
+    miningCost: 0,
+    miningThirstCost: 0,
     chargingWeapon: undefined,
+    pendingSwing: undefined,
+    unpairedHitTick: undefined,
     lastMeleeHitTick: undefined,
     lastMeleeTargetId: undefined,
     recoveryBlockedTicks: 0
@@ -156,14 +176,52 @@ function thirstLossMultiplier(player) {
 
 function staminaRecoveryMultiplier(player) {
   const value = player.getDynamicProperty(STAMINA_RECOVERY_MULTIPLIER_KEY);
-  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
+  const temperature = typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
+  const hunger = player.getComponent("minecraft:player.hunger")?.currentValue;
+  return temperature * (hunger === 0 ? 0.5 : hunger !== undefined && hunger <= 6 ? 0.75 : 1);
+}
+
+function armorExertionMultiplier(state) {
+  // ponytail: load is sampled once per second; equipment-change signals can tighten swap latency later.
+  if (!state.armorSample || system.currentTick - state.armorSample.tick >= 20) {
+    const equipment = state.player.getComponent("minecraft:equippable");
+    let load = 0;
+    if (equipment) for (const slot of ARMOR_SLOTS) {
+      const id = equipment.getEquipment(slot)?.typeId ?? "";
+      const match = /^minecraft:(chainmail|copper|golden|iron|diamond|netherite)_(helmet|chestplate|leggings|boots)$/.exec(id);
+      load += match ? ARMOR_LOAD[match[1]] : 0;
+    }
+    state.armorSample = { tick: system.currentTick, multiplier: 1 + Math.min(0.5, load) };
+  }
+  return state.armorSample.multiplier;
 }
 
 function headInWater(player) {
   if (!player.isInWater) return false;
-  const block = player.dimension.getBlock(player.getHeadLocation());
-  return block?.typeId === "minecraft:water" || block?.typeId === "minecraft:flowing_water"
-    || block?.typeId === "minecraft:bubble_column";
+  try {
+    const block = player.dimension.getBlock(player.getHeadLocation());
+    return block?.typeId === "minecraft:water" || block?.typeId === "minecraft:flowing_water"
+      || block?.typeId === "minecraft:bubble_column";
+  } catch { return false; } // An unreadable head cell must not stop the other status updates.
+}
+
+function freshWater(state) {
+  const player = state.player;
+  const dimension = player.dimension;
+  const sample = state.waterSample;
+  if (!sample || sample.dimension !== dimension.id || system.currentTick - sample.tick >= 20) {
+    const next = { dimension: dimension.id, tick: system.currentTick, fresh: false };
+    // ponytail: infer salt from the immersion biome, not water provenance; resample once per second.
+    try {
+      const head = player.getHeadLocation();
+      const { min, max } = dimension.heightRange;
+      const biome = dimension.getBiome({ x: Math.floor(head.x),
+        y: Math.max(min, Math.min(max - 1, Math.floor(head.y))), z: Math.floor(head.z) }).id;
+      next.fresh = typeof biome === "string" && !SEA_BIOMES.has(biome);
+    } catch { /* Unknown water does not grant hydration; retry on the next sample. */ }
+    state.waterSample = next;
+  }
+  return state.waterSample.fresh;
 }
 
 function exposedToRain(player) {
@@ -178,20 +236,25 @@ function exposedToRain(player) {
 }
 
 function loseThirst(state, amount) {
-  if (thirstEnabled() && !exposedToRain(state.player))
+  if (thirstEnabled() && (!exposedToRain(state.player) || headInWater(state.player)))
     setThirst(state, state.thirst - thirstLossMultiplier(state.player) * amount);
 }
 
-function tickThirst(state, jumped, chargingWeapon) {
+function tickThirst(state, jumped, mining, chargingWeapon, exertion) {
   const player = state.player;
-  const movement = player.isSwimming ? SWIM_THIRST_EXTRA
-    : player.isSprinting ? SPRINT_THIRST_EXTRA : 0;
+  const movement = (player.isSwimming ? SWIM_THIRST_EXTRA
+    : player.isSprinting ? SPRINT_THIRST_EXTRA : 0) * exertion;
   const submerged = headInWater(player);
+  if (!submerged) state.waterSample = undefined;
+  const hydrating = submerged && freshWater(state);
   const raining = !submerged && exposedToRain(player);
-  const change = submerged ? UNDERWATER_THIRST_GAIN
+  if (mining && !hydrating && !raining) state.miningThirstCost = Math.min(MIN_BLOCK_THIRST_LOSS,
+    state.miningThirstCost + MINING_THIRST_EXTRA);
+  const change = hydrating ? UNDERWATER_THIRST_GAIN
     : raining ? RAIN_THIRST_GAIN
       : -thirstLossMultiplier(player) * (PASSIVE_THIRST_LOSS + movement
-      + (jumped ? JUMP_THIRST_LOSS : 0)
+      + (jumped ? JUMP_THIRST_LOSS * exertion : 0)
+      + (mining ? MINING_THIRST_EXTRA : 0)
       + (chargingWeapon === "minecraft:crossbow" ? CROSSBOW_THIRST_EXTRA
         : chargingWeapon ? BOW_THIRST_EXTRA : 0));
   setThirst(state, state.thirst + change);
@@ -217,8 +280,9 @@ function tickThirst(state, jumped, chargingWeapon) {
 }
 
 function hydrationFor(item) {
-  // Script API 2.3 cannot inspect potion contents; water and drinkable potions share this gain.
-  if (item.typeId === "minecraft:potion") return 20;
+  if (item.typeId === "minecraft:potion") {
+    return item.getComponent("minecraft:potion")?.potionEffectType?.id === "minecraft:water" ? 25 : 5;
+  }
   return DRINK_GAIN[item.typeId] ?? 0;
 }
 
@@ -274,6 +338,29 @@ export function staminaAllowsAction(player) {
   return value > 0 && !exhausted;
 }
 
+function miningNow(state) {
+  const target = state.mining;
+  if (!target) return false;
+  try {
+    if (state.player.dimension.id === target.dimension.id &&
+        target.dimension.getBlock(target.location)?.typeId === target.typeId) return true;
+  } catch { /* The chunk or dimension may have unloaded. */ }
+  state.mining = undefined;
+  state.miningCost = 0;
+  state.miningThirstCost = 0;
+  return false;
+}
+
+function settleSwing(state) {
+  const swing = state.pendingSwing;
+  if (!swing || swing.settled) return;
+  swing.settled = true;
+  if (!activeMode(state.player)) return;
+  if (staminaEnabled() && !state.exhausted)
+    setValue(state, state.value - (swing.hit ? 2 : 1));
+  loseThirst(state, swing.hit ? HIT_THIRST_LOSS : MISS_THIRST_LOSS);
+}
+
 function markMeleeHit(player, target) {
   if (!activeMode(player) || (!staminaEnabled() && !thirstEnabled())) return;
   const state = stateFor(player);
@@ -282,11 +369,26 @@ function markMeleeHit(player, target) {
   // Contact and damage callbacks can both report one attack; never charge that attack twice.
   if (state.lastMeleeHitTick === tick ||
       targetId && targetId === state.lastMeleeTargetId && tick - state.lastMeleeHitTick <= 1) return;
-  if (staminaEnabled() && staminaAllowsAction(player)) {
-    setValue(state, state.value - 2);
-    state.recoveryBlockedTicks = 10;
+  const swing = state.pendingSwing;
+  if (swing?.hit && tick - swing.hitTick <= 1) return;
+  if (swing && !swing.hit && tick - swing.tick <= SWING_HIT_GRACE_TICKS) {
+    swing.hit = true;
+    swing.hitTick = tick;
+    if (swing.settled) {
+      if (swing.staminaEligible && staminaEnabled()) setValue(state, state.value - 1);
+      loseThirst(state, HIT_THIRST_LOSS - MISS_THIRST_LOSS);
+    }
+    if (swing.staminaEligible && staminaEnabled()) state.recoveryBlockedTicks = 10;
+  } else {
+    // A confirmed hit is authoritative even if the swing callback was omitted or arrives later.
+    const staminaEligible = staminaEnabled() && staminaAllowsAction(player);
+    if (staminaEligible) {
+      setValue(state, state.value - 2);
+      state.recoveryBlockedTicks = 10;
+    }
+    loseThirst(state, HIT_THIRST_LOSS);
+    state.unpairedHitTick = tick;
   }
-  loseThirst(state, HIT_THIRST_LOSS);
   state.lastMeleeHitTick = tick;
   state.lastMeleeTargetId = targetId;
 }
@@ -342,7 +444,11 @@ function tickPlayer(state, staminaOn, thirstOn) {
   const still = velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2 <= 0.0009;
   const jumped = state.wasGrounded === true && !grounded && velocity.y > 0.08 && player.isJumping;
   const recovery = staminaRecoveryMultiplier(player);
+  const exertion = player.isSwimming || player.isSprinting || jumped ? armorExertionMultiplier(state) : 1;
   state.wasGrounded = grounded;
+  const swingResolving = state.pendingSwing?.staminaEligible && !state.pendingSwing.settled;
+  if (state.pendingSwing && system.currentTick - state.pendingSwing.tick >= 2) settleSwing(state);
+  const mining = miningNow(state);
   const chargingWeapon = state.chargingWeapon;
 
   if (staminaOn) {
@@ -355,14 +461,18 @@ function tickPlayer(state, staminaOn, thirstOn) {
       setValue(state, state.value + (recoveryBlocked ? 0 : rate * recovery));
     } else {
       let change;
-      if (player.isSwimming) change = -SWIM_COST;
+      if (player.isSwimming) change = -SWIM_COST * exertion;
       else if (player.isGliding) change = SLOW_RECOVERY;
-      else if (player.isSprinting) change = -SPRINT_COST;
+      else if (player.isSprinting) change = -SPRINT_COST * exertion;
       else if (player.isInWater) change = SLOW_RECOVERY;
       else change = player.isSneaking || still ? FAST_RECOVERY : SLOW_RECOVERY;
-      if (change > 0 && (chargingWeapon || recoveryBlocked)) change = 0;
+      if (change > 0 && (mining || chargingWeapon || recoveryBlocked || swingResolving)) change = 0;
+      if (mining) {
+        change -= MINING_COST;
+        state.miningCost = Math.min(MIN_BLOCK_COST, state.miningCost + MINING_COST);
+      }
       if (chargingWeapon) change -= chargingWeapon === "minecraft:crossbow" ? CROSSBOW_COST : BOW_COST;
-      setValue(state, state.value + (change > 0 ? change * recovery : change) - (jumped ? JUMP_COST : 0));
+      setValue(state, state.value + (change > 0 ? change * recovery : change) - (jumped ? JUMP_COST * exertion : 0));
     }
     if (state.exhausted && !chargingWeapon && (player.isSprinting || player.isSwimming)) {
       if (state.slowRefresh <= 0) {
@@ -376,14 +486,34 @@ function tickPlayer(state, staminaOn, thirstOn) {
     state.slowRefresh = 0;
     state.recoveryBlockedTicks = 0;
   }
-  if (thirstOn) tickThirst(state, jumped, chargingWeapon);
+  if (thirstOn) tickThirst(state, jumped, mining, chargingWeapon, exertion);
   else {
+    state.waterSample = undefined;
     state.damageTicks = 0;
     state.damageSevere = false;
     state.nauseaTicks = 0;
   }
   if (player.isValid !== false) publish(state);
 }
+
+world.afterEvents.playerSwingStart.subscribe(({ player, swingSource }) => {
+  const staminaOn = staminaEnabled();
+  const thirstOn = thirstEnabled();
+  if (swingSource !== "Attack" || !activeMode(player) || (!staminaOn && !thirstOn)) return;
+  const state = stateFor(player);
+  if (state.pendingSwing) settleSwing(state);
+  const pairedHit = state.unpairedHitTick !== undefined &&
+    system.currentTick - state.unpairedHitTick <= 1;
+  state.unpairedHitTick = undefined;
+  if (pairedHit) {
+    state.pendingSwing = { tick: system.currentTick, hit: true, hitTick: state.lastMeleeHitTick,
+      settled: true, staminaEligible: false };
+    return;
+  }
+  if (!staminaAllowsAction(player) && !thirstOn) return;
+  state.pendingSwing = { tick: system.currentTick, hit: false, settled: false,
+    staminaEligible: staminaOn && staminaAllowsAction(player) };
+});
 
 world.afterEvents.entityHitEntity.subscribe(({ damagingEntity, hitEntity }) => {
   if (damagingEntity.typeId === "minecraft:player") markMeleeHit(damagingEntity, hitEntity);
@@ -402,13 +532,38 @@ world.afterEvents.entityHurt.subscribe(({ hurtEntity, damage, damageSource }) =>
   } catch (error) { console.warn(`[stamina] 受伤扣体力失败：${error}`); }
 });
 
-world.afterEvents.playerBreakBlock.subscribe(({ player }) => {
+world.afterEvents.playerStartBreakingBlock.subscribe(({ player, block }) => {
+  if (!activeMode(player) || (!staminaEnabled() && !thirstEnabled())) return;
+  const state = stateFor(player);
+  state.mining = {
+    dimension: block.dimension, location: { ...block.location }, typeId: block.typeId
+  };
+  state.miningCost = 0;
+  state.miningThirstCost = 0;
+});
+
+function stopMining({ player, block }) {
+  const state = states.get(player.id);
+  if (state?.mining && state.mining.location.x === block.location.x &&
+      state.mining.location.y === block.location.y && state.mining.location.z === block.location.z) {
+    state.mining = undefined;
+    state.miningCost = 0;
+    state.miningThirstCost = 0;
+  }
+}
+
+world.afterEvents.playerCancelBreakingBlock.subscribe(stopMining);
+world.afterEvents.playerBreakBlock.subscribe((event) => {
+  const { player, block } = event;
   if (activeMode(player) && (staminaEnabled() || thirstEnabled())) {
     const state = stateFor(player);
+    const tracked = state.mining && state.mining.location.x === block.location.x &&
+      state.mining.location.y === block.location.y && state.mining.location.z === block.location.z;
     if (staminaEnabled() && !state.exhausted)
-      setValue(state, state.value - MIN_BLOCK_COST);
-    loseThirst(state, MIN_BLOCK_THIRST_LOSS);
+      setValue(state, state.value - Math.max(0, MIN_BLOCK_COST - (tracked ? state.miningCost : 0)));
+    loseThirst(state, Math.max(0, MIN_BLOCK_THIRST_LOSS - (tracked ? state.miningThirstCost : 0)));
   }
+  stopMining(event);
 });
 
 world.afterEvents.itemStartUse.subscribe(({ source, itemStack }) => {
@@ -428,11 +583,26 @@ world.afterEvents.playerHotbarSelectedSlotChange.subscribe(({ player }) => {
   const state = states.get(player.id);
   if (state) {
     state.chargingWeapon = undefined;
+    state.mining = undefined;
+    state.miningCost = 0;
+    state.miningThirstCost = 0;
   }
 });
 
 world.beforeEvents.playerBreakBlock.subscribe((event) => {
   if (!staminaAllowsAction(event.player)) event.cancel = true;
+});
+
+world.beforeEvents.entityHurt.subscribe((event) => {
+  const { cause, damagingEntity, damagingProjectile } = event.damageSource;
+  let attacker = damagingEntity;
+  if (cause === "projectile" && attacker?.typeId !== "minecraft:player") {
+    try { attacker = damagingProjectile?.getComponent("minecraft:projectile")?.owner; }
+    catch { /* Some projectile types expose no owner. */ }
+  }
+  if ((cause === "entityAttack" || cause === "projectile") &&
+      attacker?.typeId === "minecraft:player" && !staminaAllowsAction(attacker))
+    event.cancel = true;
 });
 
 world.beforeEvents.itemUse.subscribe((event) => {
@@ -443,8 +613,8 @@ world.beforeEvents.itemUse.subscribe((event) => {
 
 system.afterEvents.scriptEventReceive.subscribe((event) => {
   if (event.id !== EVENT_ID && event.id !== THIRST_EVENT_ID) return;
-  const player = world.getAllPlayers().find((candidate) => candidate.id === event.sourceEntity?.id);
-  if (!player) return;
+  const player = event.sourceEntity;
+  if (player?.typeId !== "minecraft:player") return;
   if (player.playerPermissionLevel !== PlayerPermissionLevel.Operator) return;
   const command = event.message.trim().toLowerCase();
   const state = stateFor(player);
@@ -514,9 +684,14 @@ system.runInterval(() => {
       if (active && (staminaOn || thirstOn)) tickPlayer(state, staminaOn, thirstOn);
       else {
         syncExhaustion(state, false);
-        state.lastMeleeHitTick = state.lastMeleeTargetId = undefined;
+        state.mining = state.pendingSwing = undefined;
+        state.unpairedHitTick = state.lastMeleeHitTick = state.lastMeleeTargetId = undefined;
+        state.miningCost = 0;
+        state.miningThirstCost = 0;
         state.chargingWeapon = undefined;
         state.wasGrounded = undefined;
+        state.waterSample = undefined;
+        state.armorSample = undefined;
         state.damageTicks = 0;
         state.damageSevere = false;
         state.nauseaTicks = 0;
@@ -542,10 +717,15 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
       state.display = 100;
       state.thirstDisplay = 100;
       state.wasGrounded = undefined;
+      state.waterSample = undefined;
+      state.armorSample = undefined;
       state.damageTicks = 0;
       state.damageSevere = false;
       state.nauseaTicks = 0;
-      state.lastMeleeHitTick = state.lastMeleeTargetId = undefined;
+      state.mining = state.pendingSwing = undefined;
+      state.unpairedHitTick = state.lastMeleeHitTick = state.lastMeleeTargetId = undefined;
+      state.miningCost = 0;
+      state.miningThirstCost = 0;
       state.chargingWeapon = undefined;
       state.recoveryBlockedTicks = 0;
       if (activeMode(player) || state.debug || state.thirstDebug) publish(state);

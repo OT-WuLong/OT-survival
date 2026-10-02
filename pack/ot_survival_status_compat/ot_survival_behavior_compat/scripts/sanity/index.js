@@ -1,4 +1,4 @@
-import { GameMode, PlayerPermissionLevel, system, world } from "@minecraft/server";
+import { BlockVolume, GameMode, PlayerPermissionLevel, system, world } from "@minecraft/server";
 import { legacyScore, statusEnabled, setStatusEnabled } from "../status_flags.js";
 
 const VALUE_KEY = "ot:sanity_value";
@@ -14,6 +14,8 @@ const HURT_TOTAL_KEY = "ot:sanity_hurt_total";
 const SCORE_ID = "ot_sanity";
 const DAY = 24000;
 const MINUTE = 1200;
+const MUSIC_RADIUS = 8;
+const MUSIC_GAIN_PER_SECOND = 2 / 60;
 const states = new Map();
 const warned = new Set();
 let scoreboardWarned = false;
@@ -127,6 +129,32 @@ function pressure(state, now) {
   return safe ? 3 / 60 : -totalLoss / 60;
 }
 
+function musicNearby(player) {
+  try {
+    const head = player.getHeadLocation();
+    const dimension = player.dimension;
+    const { min, max } = dimension.heightRange;
+    const lowerY = Math.max(min, Math.floor(head.y - MUSIC_RADIUS));
+    const upperY = Math.min(max - 1, Math.floor(head.y + MUSIC_RADIUS));
+    if (lowerY > upperY) return false;
+    const volume = new BlockVolume(
+      { x: Math.floor(head.x - MUSIC_RADIUS), y: lowerY, z: Math.floor(head.z - MUSIC_RADIUS) },
+      { x: Math.floor(head.x + MUSIC_RADIUS), y: upperY, z: Math.floor(head.z + MUSIC_RADIUS) });
+    // One native filtered search per second, not a JavaScript loop over every nearby block.
+    const locations = dimension.getBlocks(volume, { includeTypes: ["minecraft:jukebox"] }, true)
+      .getBlockLocationIterator();
+    for (const location of locations) {
+      const distanceSquared = (location.x + 0.5 - head.x) ** 2 +
+        (location.y + 0.5 - head.y) ** 2 + (location.z + 0.5 - head.z) ** 2;
+      if (distanceSquared > MUSIC_RADIUS ** 2) continue;
+      try {
+        if (dimension.getBlock(location)?.getComponent("minecraft:record_player")?.isPlaying()) return true;
+      } catch { /* One removed or unloaded jukebox must not hide the others. */ }
+    }
+  } catch { /* Unavailable chunks or an invalid search region cannot grant a music bonus. */ }
+  return false;
+}
+
 function effects(state) {
   const player = state.player;
   const now = state.activeTicks;
@@ -238,7 +266,9 @@ system.runInterval(() => {
     sleepCheck(state, now);
     if (!update) continue;
     if (sanityEnabled() && activeMode(player)) {
-      setValue(state, state.value + pressure(state, now));
+      const change = pressure(state, now);
+      const music = (state.value < 100 || change < 0) && musicNearby(player);
+      setValue(state, state.value + change + (music ? MUSIC_GAIN_PER_SECOND : 0));
       effects(state);
     } else {
       state.darkSeconds = 0;

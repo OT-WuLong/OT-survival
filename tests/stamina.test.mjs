@@ -11,13 +11,13 @@ const positionsScript = readFileSync(new URL(
   "../pack/ot_survival_status/ot_survival_behavior/scripts/hud_positions.js", import.meta.url), "utf8")
   .replace(/^export /gm, "");
 const script = readFileSync(new URL(
-  "../pack/ot_survival_status/ot_survival_behavior/scripts/stamina_probe/index.js", import.meta.url), "utf8")
+  "../pack/ot_survival_status/ot_survival_behavior/scripts/stamina/index.js", import.meta.url), "utf8")
   .replace(/^import \{[^\n]+\} from "@minecraft\/server";\s*/, "")
   .replace(/^import \{[^\n]+\} from "\.\.\/status_flags\.js";\s*/, "")
   .replace(/^import \{[^\n]+\} from "\.\.\/hud_positions\.js";\s*/, "")
   .replace(/^export /gm, "");
 const compatScript = readFileSync(new URL(
-  "../pack/ot_survival_status_compat/ot_survival_behavior_compat/scripts/stamina_probe/index.js", import.meta.url), "utf8")
+  "../pack/ot_survival_status_compat/ot_survival_behavior_compat/scripts/stamina/index.js", import.meta.url), "utf8")
   .replace(/^import [^\n]+\n/gm, "").replace(/^export /gm, "");
 const ui = JSON.parse(readFileSync(new URL(
   "../pack/ot_survival_status/ot_survival_resource/ui/hud_screen.json", import.meta.url), "utf8"));
@@ -49,6 +49,7 @@ function harness(mode = "survival", legacyScores = {}, implementation = script) 
   const objectives = new Map();
   const commands = [];
   const permissions = { jump: true, changes: [] };
+  const equipment = new Map();
   const player = {
     id: "player-1",
     typeId: "minecraft:player",
@@ -64,11 +65,29 @@ function harness(mode = "survival", legacyScores = {}, implementation = script) 
     headBlockType: "minecraft:air",
     mineBlockType: "minecraft:stone",
     health: 20,
+    hunger: 20,
+    biomeId: "minecraft:plains",
+    biomeQueries: 0,
+    armorQueries: 0,
     velocity: { x: 0, y: 0, z: 0 },
     getGameMode() { return this.mode; },
     getVelocity() { return this.velocity; },
     getHeadLocation() { return { x: 0, y: 2, z: 0 }; },
+    getComponent(id) {
+      if (id === "minecraft:player.hunger") return { currentValue: this.hunger };
+      if (id === "minecraft:equippable") return { getEquipment(slot) {
+        player.armorQueries++;
+        return equipment.get(slot);
+      } };
+      return undefined;
+    },
     dimension: { id: "minecraft:overworld",
+      heightRange: { min: -64, max: 320 },
+      getBiome(location) {
+        player.biomeQueries++;
+        assert.ok(location.y >= this.heightRange.min && location.y < this.heightRange.max);
+        return { id: player.biomeId };
+      },
       getTopmostBlock() { return { location: { y: player.roofed ? 3 : 1 } }; },
       getBlock(location) {
       return { typeId: location.x === 1 ? player.mineBlockType : player.headBlockType };
@@ -99,6 +118,7 @@ function harness(mode = "survival", legacyScores = {}, implementation = script) 
   };
   const signal = (save) => ({ subscribe: (callback) => save(callback) });
   const sandbox = {
+    EquipmentSlot: { Head: "Head", Chest: "Chest", Legs: "Legs", Feet: "Feet" },
     GameMode: { Survival: "survival", Adventure: "adventure" },
     InputPermissionCategory: { Jump: "Jump" },
     PlayerPermissionLevel: { Operator: 2 },
@@ -150,7 +170,7 @@ function harness(mode = "survival", legacyScores = {}, implementation = script) 
     sandbox.world.scoreboard.addObjective(id, id).setScore(player, score);
   runInNewContext(`${flagsScript}\n${positionsScript}\n${implementation}\nglobalThis.statusSwitches = { setStaminaEnabled, setThirstEnabled, stateFor };`, sandbox);
   return {
-    player, properties, worldProperties, permissions, titles, effects, objectives, commands,
+    player, properties, worldProperties, permissions, titles, effects, objectives, commands, equipment,
     setStaminaEnabled: sandbox.statusSwitches.setStaminaEnabled,
     setThirstEnabled: sandbox.statusSwitches.setThirstEnabled,
     staminaValue: () => sandbox.statusSwitches.stateFor(player).value,
@@ -196,6 +216,228 @@ function harness(mode = "survival", legacyScores = {}, implementation = script) 
     leave: () => onLeave({ playerId: player.id }),
     respawn: () => onSpawn({ player, initialSpawn: false })
   };
+}
+
+for (const [edition, implementation] of [["full", script], ["compat", compatScript]]) {
+test(`${edition}: armor material prices multiply sprint and swim without per-tick equipment scans`, () => {
+  for (const [material, multiplier] of [["leather", 1], ["chainmail", 1.2], ["copper", 1.3],
+    ["golden", 1.4], ["iron", 1.4], ["diamond", 1.3], ["netherite", 1.5]]) {
+    for (const swimming of [false, true]) {
+      const scene = harness("survival", {}, implementation);
+      for (const [slot, part] of [["Head", "helmet"], ["Chest", "chestplate"], ["Legs", "leggings"], ["Feet", "boots"]])
+        scene.equipment.set(slot, { typeId: `minecraft:${material}_${part}` });
+      scene.command("50");
+      scene.command("50", "ot:thirst_test");
+      scene.player.isSprinting = true;
+      scene.player.isSwimming = swimming;
+      scene.tick(20);
+      assert.ok(Math.abs(scene.staminaValue() - (50 - (swimming ? 4 : 3) * multiplier)) < 1e-9,
+        `${material}, swimming ${swimming}`);
+      assert.ok(Math.abs(scene.thirstValue() - (50 - 0.05 - (swimming ? 0.1 : 0.075) * multiplier)) < 1e-9);
+      assert.equal(scene.player.armorQueries, 4, "only four equipment reads per second of exertion");
+    }
+  }
+});
+
+test(`${edition}: mixed worn armor adds once to sprinting jumps, not items in the inventory or offhand`, () => {
+  const scene = harness("survival", {}, implementation);
+  scene.equipment.set("Head", { typeId: "minecraft:iron_helmet" });
+  scene.equipment.set("Chest", { typeId: "minecraft:elytra" });
+  scene.equipment.set("Legs", { typeId: "minecraft:diamond_leggings" });
+  scene.equipment.set("Feet", { typeId: "minecraft:netherite_boots" });
+  scene.equipment.set("Offhand", { typeId: "minecraft:netherite_chestplate" });
+  scene.equipment.set("Inventory", { typeId: "minecraft:netherite_helmet" });
+  scene.tick();
+  scene.command("50");
+  scene.command("50", "ot:thirst_test");
+  scene.player.isSprinting = true;
+  scene.player.isOnGround = false;
+  scene.player.isJumping = true;
+  scene.player.velocity = { x: 0.1, y: 0.2, z: 0 };
+  scene.tick();
+  assert.ok(Math.abs(scene.staminaValue() - (50 - (0.15 + 2) * 1.3)) < 1e-9);
+  assert.ok(Math.abs(scene.thirstValue() - (50 - 1 / 400 - (0.00375 + 0.05) * 1.3)) < 1e-9);
+  scene.player.isSprinting = false;
+  scene.tick();
+  assert.ok(Math.abs(scene.staminaValue() - (50 - (0.15 + 2) * 1.3 + 0.2)) < 1e-9,
+    "holding jump in the air does not pay a second jump");
+  assert.equal(scene.player.armorQueries, 4);
+});
+
+test(`${edition}: armor does not reduce recovery or raise combat, mining or weapon-loading fees`, () => {
+  for (const motion of ["rest", "walk", "water", "glide"]) {
+    const scene = harness("survival", {}, implementation);
+    for (const [slot, part] of [["Head", "helmet"], ["Chest", "chestplate"], ["Legs", "leggings"], ["Feet", "boots"]])
+      scene.equipment.set(slot, { typeId: `minecraft:netherite_${part}` });
+    scene.command("50");
+    if (motion === "walk") scene.player.velocity.x = 0.1;
+    if (motion === "water") scene.player.isInWater = true;
+    if (motion === "glide") scene.player.isGliding = true;
+    scene.tick(20);
+    assert.ok(Math.abs(scene.staminaValue() - (motion === "rest" ? 58 : 54)) < 1e-9, motion);
+    assert.equal(scene.player.armorQueries, 0, "recovery does not query load");
+  }
+  for (const action of ["hit", "bow", "crossbow", "break"]) {
+    const scenes = [harness("survival", {}, implementation), harness("survival", {}, implementation)];
+    for (const [slot, part] of [["Head", "helmet"], ["Chest", "chestplate"], ["Legs", "leggings"], ["Feet", "boots"]])
+      scenes[1].equipment.set(slot, { typeId: `minecraft:netherite_${part}` });
+    for (const scene of scenes) {
+      scene.command("50");
+      scene.command("50", "ot:thirst_test");
+      if (action === "hit") scene.hit();
+      else if (action === "break") scene.mineBreak();
+      else scene.bowStart(`minecraft:${action}`);
+      scene.tick(action === "hit" || action === "break" ? 2 : 20);
+    }
+    assert.ok(Math.abs(scenes[0].staminaValue() - scenes[1].staminaValue()) < 1e-9, action);
+    assert.ok(Math.abs(scenes[0].thirstValue() - scenes[1].thirstValue()) < 1e-9, action);
+  }
+});
+
+test(`${edition}: load refreshes on expiry and respawn while status switches and water keep their rules`, () => {
+  const scene = harness("survival", {}, implementation);
+  scene.equipment.set("Chest", { typeId: "minecraft:iron_chestplate" });
+  scene.command("50");
+  scene.command("50", "ot:thirst_test");
+  scene.player.isSprinting = true;
+  scene.setStaminaEnabled(false);
+  scene.tick(20);
+  assert.equal(scene.staminaValue(), 50);
+  assert.ok(Math.abs(scene.thirstValue() - (50 - 0.05 - 0.075 * 1.1)) < 1e-9);
+  scene.equipment.clear();
+  scene.setStaminaEnabled(true);
+  scene.setThirstEnabled(false);
+  scene.tick(20);
+  assert.ok(Math.abs(scene.staminaValue() - 47) < 1e-9, "equipment removal takes effect within one second");
+  assert.equal(scene.player.armorQueries, 8);
+  scene.equipment.set("Chest", { typeId: "minecraft:netherite_chestplate" });
+  scene.respawn();
+  scene.tick();
+  assert.ok(Math.abs(scene.staminaValue() - (100 - 0.15 * 1.125)) < 1e-9, "respawn discards the old load sample");
+  scene.player.isSprinting = false;
+  scene.command("0");
+  scene.tick(51);
+  assert.ok(scene.staminaValue() >= 20);
+  assert.equal(scene.permissions.jump, true, "heavy armor does not trap an exhausted resting player");
+  scene.setThirstEnabled(true);
+  scene.command("50", "ot:thirst_test");
+  scene.player.isSwimming = true;
+  scene.player.isInWater = true;
+  scene.player.headBlockType = "minecraft:water";
+  scene.tick(20);
+  assert.ok(Math.abs(scene.thirstValue() - 51) < 1e-9, "freshwater still replaces activity thirst loss");
+  scene.player.headBlockType = "minecraft:air";
+  scene.player.isInWater = false;
+  scene.player.isSwimming = false;
+  scene.player.isSprinting = true;
+  scene.worldProperties.set("ot:temperature_weather", "Rain");
+  scene.command("50", "ot:thirst_test");
+  scene.tick(20);
+  assert.ok(Math.abs(scene.thirstValue() - 50.1) < 1e-9, "rain still replaces activity thirst loss");
+});
+
+test(`${edition}: hunger slows recovery only, multiplies cold and does not trap exhausted players`, () => {
+  for (const [hunger, multiplier] of [[20, 1], [7, 1], [6, 0.75], [1, 0.75], [0, 0.5], [undefined, 1]]) {
+    const scene = harness("survival", {}, implementation);
+    scene.player.hunger = hunger;
+    scene.command("50");
+    scene.tick(20);
+    assert.ok(Math.abs(scene.staminaValue() - (50 + 8 * multiplier)) < 1e-9, `rest, hunger ${hunger}`);
+    scene.command("50");
+    scene.player.velocity.x = 0.1;
+    scene.properties.set("ot:stamina_recovery_multiplier", 0.5);
+    scene.tick(20);
+    assert.ok(Math.abs(scene.staminaValue() - (50 + 4 * 0.5 * multiplier)) < 1e-9, `walking in cold, hunger ${hunger}`);
+    scene.command("50");
+    scene.player.isSprinting = true;
+    scene.tick(20);
+    assert.ok(Math.abs(scene.staminaValue() - 47) < 1e-9, "hunger and cold do not multiply consumption");
+    scene.setStaminaEnabled(false);
+    scene.tick(20);
+    assert.ok(Math.abs(scene.staminaValue() - 47) < 1e-9, "switch still freezes the mechanism");
+  }
+  const empty = harness("survival", {}, implementation);
+  empty.player.hunger = 0;
+  empty.command("0");
+  assert.equal(empty.tryBreak(), true);
+  empty.tick(101);
+  assert.ok(empty.staminaValue() >= 20, "starving players still recover enough to escape exhaustion");
+  assert.equal(empty.permissions.jump, true);
+});
+
+test(`${edition}: freshwater hydrates but every vanilla ocean family retains ordinary thirst loss`, () => {
+  for (const biome of ["minecraft:ocean", "minecraft:deep_ocean", "minecraft:warm_ocean",
+    "minecraft:deep_warm_ocean", "minecraft:lukewarm_ocean", "minecraft:deep_lukewarm_ocean",
+    "minecraft:cold_ocean", "minecraft:deep_cold_ocean", "minecraft:frozen_ocean",
+    "minecraft:deep_frozen_ocean", "minecraft:legacy_frozen_ocean"]) {
+    const scene = harness("survival", {}, implementation);
+    scene.player.biomeId = biome;
+    scene.player.isInWater = true;
+    scene.player.headBlockType = "minecraft:water";
+    scene.command("50", "ot:thirst_test");
+    scene.tick(20);
+    assert.ok(Math.abs(scene.thirstValue() - 49.95) < 1e-9, biome);
+    assert.equal(scene.player.biomeQueries, 1, "one biome sample per second, not per tick");
+    scene.player.isSwimming = true;
+    scene.setStaminaEnabled(false);
+    scene.tick(20);
+    assert.ok(Math.abs(scene.thirstValue() - 49.8) < 1e-9, `${biome}: swimming loss remains independent of stamina`);
+    scene.drink("minecraft:potion");
+    assert.ok(Math.abs(scene.thirstValue() - (49.8 + (edition === "full" ? 25 : 20))) < 1e-9,
+      "bottled water keeps its established gain regardless of biome");
+  }
+  for (const [biome, block] of [["minecraft:river", "minecraft:water"],
+    ["minecraft:frozen_river", "minecraft:flowing_water"], ["minecraft:plains", "minecraft:bubble_column"]]) {
+    const scene = harness("survival", {}, implementation);
+    scene.player.biomeId = biome;
+    scene.player.isInWater = true;
+    scene.player.headBlockType = block;
+    scene.command("50", "ot:thirst_test");
+    scene.tick(20);
+    assert.ok(Math.abs(scene.thirstValue() - 51) < 1e-9, `${biome}: fresh ${block}`);
+  }
+});
+
+test(`${edition}: water classification handles biome changes, dimensions, rain, unavailable cells and switches`, () => {
+  const scene = harness("survival", {}, implementation);
+  scene.player.biomeId = "minecraft:ocean";
+  scene.player.isInWater = true;
+  scene.player.headBlockType = "minecraft:water";
+  scene.worldProperties.set("ot:temperature_weather", "Rain");
+  scene.command("50", "ot:thirst_test");
+  scene.tick(20);
+  assert.ok(Math.abs(scene.thirstValue() - 49.95) < 1e-9, "rain above a submerged sea head does not grant water");
+  scene.hit();
+  assert.ok(Math.abs(scene.thirstValue() - 49.9) < 1e-9, "a submerged sea attack retains its instant fee, even when raining above");
+  scene.player.biomeId = "minecraft:river";
+  scene.tick();
+  assert.ok(Math.abs(scene.thirstValue() - 49.95) < 1e-9, "biome classification refreshes within one second");
+  scene.player.dimension.id = "minecraft:the_end";
+  scene.player.biomeId = "minecraft:ocean";
+  scene.tick();
+  assert.ok(scene.thirstValue() < 49.95, "dimension changes invalidate a cached fresh classification immediately");
+  scene.setThirstEnabled(false);
+  const queries = scene.player.biomeQueries;
+  const frozen = scene.thirstValue();
+  scene.tick(30);
+  assert.equal(scene.player.biomeQueries, queries);
+  assert.equal(scene.thirstValue(), frozen);
+  scene.setThirstEnabled(true);
+  scene.player.dimension.getBiome = () => { throw new Error("LocationInUnloadedChunkError"); };
+  scene.tick(20);
+  assert.ok(scene.thirstValue() < frozen, "unreadable water never grants free hydration");
+  scene.player.dimension.getBlock = () => { throw new Error("LocationOutOfWorldBoundariesError"); };
+  scene.command("50");
+  scene.tick(20);
+  assert.ok(scene.staminaValue() > 50, "an invalid head cell does not stop stamina updates");
+  const above = harness("survival", {}, implementation);
+  above.player.isInWater = true;
+  above.player.headBlockType = "minecraft:water";
+  above.player.getHeadLocation = () => ({ x: 0, y: 332, z: 0 });
+  above.command("50", "ot:thirst_test");
+  above.tick();
+  assert.equal(above.player.biomeQueries, 1, "biome sampling is clipped to dimension height");
+});
 }
 
 test("status values mirror to command-readable scoreboards without idle writes", () => {
@@ -256,13 +498,13 @@ test("stamina and 24px thermal HUD assets use pixel-aligned sizes", () => {
   assert.deepEqual(imageSize("stamina_frame.png"), [16, 100]);
   assert.deepEqual(imageSize("stamina_fill.png"), [12, 96]);
   assert.deepEqual(imageSize("sanity_fill.png"), [12, 96]);
-  assert.ok(readFileSync(new URL("../assets/textures/理智.png", import.meta.url))
+  assert.ok(readFileSync(new URL("../assets/textures/sanity_fill.png", import.meta.url))
     .equals(readFileSync(new URL("../pack/ot_survival_status/ot_survival_resource/textures/ui/sanity_fill.png", import.meta.url))));
   for (const name of ["ring_empty", "ring_full", "freezing", "cold", "normal", "hot", "scorching"])
     assert.deepEqual(imageSize(`temp_${name}.png`), [24, 24]);
-  for (const [source, packed] of [["空环.png", "temp_ring_empty.png"], ["满环.png", "temp_ring_full.png"]])
-    assert.ok(readFileSync(new URL(`../assets/textures/${source}`, import.meta.url))
-      .equals(readFileSync(new URL(`../pack/ot_survival_status/ot_survival_resource/textures/ui/${packed}`, import.meta.url))));
+  for (const name of ["temp_ring_empty.png", "temp_ring_full.png"])
+    assert.ok(readFileSync(new URL(`../assets/textures/${name}`, import.meta.url))
+      .equals(readFileSync(new URL(`../pack/ot_survival_status/ot_survival_resource/textures/ui/${name}`, import.meta.url))));
   assert.equal(existsSync(new URL("../pack/ot_survival_status/ot_survival_resource/textures/ui/stamina_frame.json", import.meta.url)), false);
   const overlay = ui.ot_stamina_probe;
   assert.deepEqual(overlay.size, [8, 50]);
